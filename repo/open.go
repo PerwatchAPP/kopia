@@ -132,7 +132,46 @@ func Open(ctx context.Context, configFile, password string, options *Options) (r
 	return openDirect(ctx, configFile, lc, password, options)
 }
 
-func getContentCacheOrNil(ctx context.Context, si *APIServerInfo, opt *content.CachingOptions, password string, mr *metrics.Registry, timeNow func() time.Time) (*cache.PersistentCache, error) {
+func OpenWithConfig(ctx context.Context, configData *LocalConfig, password string, options *Options) (
+	rep Repository, err error,
+) {
+	ctx, span := tracer.Start(ctx, "OpenRepository")
+	defer span.End()
+
+	defer func() {
+		if err != nil {
+			log(ctx).Errorf("failed to open repository: %v", err)
+		}
+	}()
+
+	if options == nil {
+		options = &Options{}
+	}
+
+	if options.OnFatalError == nil {
+		options.OnFatalError = func(err error) {
+			log(ctx).Errorf("FATAL: %v", err)
+			os.Exit(1)
+		}
+	}
+
+	lc := configData
+
+	if lc.PermissiveCacheLoading && !lc.ReadOnly {
+		return nil, ErrCannotWriteToRepoConnectionWithPermissiveCacheLoading
+	}
+
+	if lc.APIServer != nil {
+		return openAPIServer(ctx, lc.APIServer, lc.ClientOptions, lc.Caching, password, options)
+	}
+
+	return openDirect(ctx, "[[PLACE_HOLDER]]", lc, password, options)
+}
+
+func getContentCacheOrNil(
+	ctx context.Context, si *APIServerInfo, opt *content.CachingOptions, password string, mr *metrics.Registry,
+	timeNow func() time.Time,
+) (*cache.PersistentCache, error) {
 	opt = opt.CloneOrDefault()
 
 	cs, err := cache.NewStorageOrNil(ctx, opt.CacheDirectory, opt.ContentCacheSizeBytes, "server-contents")
@@ -161,11 +200,13 @@ func getContentCacheOrNil(ctx context.Context, si *APIServerInfo, opt *content.C
 		return nil, errors.Wrap(err, "unable to initialize protection")
 	}
 
-	pc, err := cache.NewPersistentCache(ctx, "cache-storage", cs, prot, cache.SweepSettings{
-		MaxSizeBytes: opt.ContentCacheSizeBytes,
-		LimitBytes:   opt.ContentCacheSizeLimitBytes,
-		MinSweepAge:  opt.MinContentSweepAge.DurationOrDefault(content.DefaultDataCacheSweepAge),
-	}, mr, timeNow)
+	pc, err := cache.NewPersistentCache(
+		ctx, "cache-storage", cs, prot, cache.SweepSettings{
+			MaxSizeBytes: opt.ContentCacheSizeBytes,
+			LimitBytes:   opt.ContentCacheSizeLimitBytes,
+			MinSweepAge:  opt.MinContentSweepAge.DurationOrDefault(content.DefaultDataCacheSweepAge),
+		}, mr, timeNow,
+	)
 	if err != nil {
 		return nil, errors.Wrap(err, "unable to open persistent cache")
 	}
@@ -174,7 +215,10 @@ func getContentCacheOrNil(ctx context.Context, si *APIServerInfo, opt *content.C
 }
 
 // openAPIServer connects remote repository over Kopia API.
-func openAPIServer(ctx context.Context, si *APIServerInfo, cliOpts ClientOptions, cachingOptions *content.CachingOptions, password string, options *Options) (Repository, error) {
+func openAPIServer(
+	ctx context.Context, si *APIServerInfo, cliOpts ClientOptions, cachingOptions *content.CachingOptions,
+	password string, options *Options,
+) (Repository, error) {
 	cachingOptions = cachingOptions.CloneOrDefault()
 
 	mr := metrics.NewRegistry()
@@ -207,7 +251,9 @@ func openAPIServer(ctx context.Context, si *APIServerInfo, cliOpts ClientOptions
 }
 
 // openDirect opens the repository that directly manipulates blob storage..
-func openDirect(ctx context.Context, configFile string, lc *LocalConfig, password string, options *Options) (rep Repository, err error) {
+func openDirect(
+	ctx context.Context, configFile string, lc *LocalConfig, password string, options *Options,
+) (rep Repository, err error) {
 	if lc.Storage == nil {
 		return nil, errors.New("storage not set in the configuration file")
 	}
@@ -239,7 +285,10 @@ func openDirect(ctx context.Context, configFile string, lc *LocalConfig, passwor
 // openWithConfig opens the repository with a given configuration, avoiding the need for a config file.
 //
 //nolint:funlen,gocyclo
-func openWithConfig(ctx context.Context, st blob.Storage, cliOpts ClientOptions, password string, options *Options, cacheOpts *content.CachingOptions, configFile string) (DirectRepository, error) {
+func openWithConfig(
+	ctx context.Context, st blob.Storage, cliOpts ClientOptions, password string, options *Options,
+	cacheOpts *content.CachingOptions, configFile string,
+) (DirectRepository, error) {
 	cacheOpts = cacheOpts.CloneOrDefault()
 	cmOpts := &content.ManagerOptions{
 		TimeNow:                defaultTime(options.TimeNowFunc),
@@ -250,7 +299,9 @@ func openWithConfig(ctx context.Context, st blob.Storage, cliOpts ClientOptions,
 	mr := metrics.NewRegistry()
 	st = storagemetrics.NewWrapper(st, mr)
 
-	fmgr, ferr := format.NewManager(ctx, st, cacheOpts.CacheDirectory, cliOpts.FormatBlobCacheDuration, password, cmOpts.TimeNow)
+	fmgr, ferr := format.NewManager(
+		ctx, st, cacheOpts.CacheDirectory, cliOpts.FormatBlobCacheDuration, password, cmOpts.TimeNow,
+	)
 	if ferr != nil {
 		return nil, errors.Wrap(ferr, "unable to create format manager")
 	}
@@ -261,10 +312,15 @@ func openWithConfig(ctx context.Context, st blob.Storage, cliOpts ClientOptions,
 	}
 
 	if fmgr.SupportsPasswordChange() {
-		cacheOpts.HMACSecret = crypto.DeriveKeyFromMasterKey(fmgr.GetHmacSecret(), fmgr.UniqueID(), localCacheIntegrityPurpose, localCacheIntegrityHMACSecretLength)
+		cacheOpts.HMACSecret = crypto.DeriveKeyFromMasterKey(
+			fmgr.GetHmacSecret(), fmgr.UniqueID(), localCacheIntegrityPurpose, localCacheIntegrityHMACSecretLength,
+		)
 	} else {
 		// deriving from ufb.FormatEncryptionKey was actually a bug, that only matters will change when we change the password
-		cacheOpts.HMACSecret = crypto.DeriveKeyFromMasterKey(fmgr.FormatEncryptionKey(), fmgr.UniqueID(), localCacheIntegrityPurpose, localCacheIntegrityHMACSecretLength)
+		cacheOpts.HMACSecret = crypto.DeriveKeyFromMasterKey(
+			fmgr.FormatEncryptionKey(), fmgr.UniqueID(), localCacheIntegrityPurpose,
+			localCacheIntegrityHMACSecretLength,
+		)
 	}
 
 	limits := throttlingLimitsFromConnectionInfo(ctx, st.ConnectionInfo())
@@ -277,16 +333,20 @@ func openWithConfig(ctx context.Context, st blob.Storage, cliOpts ClientOptions,
 		return nil, errors.Wrap(ferr, "unable to add throttler")
 	}
 
-	throttler.OnUpdate(func(l throttling.Limits) error {
-		lc2, err2 := LoadConfigFromFile(configFile)
-		if err2 != nil {
-			return err2
-		}
-
-		lc2.Throttling = &l
-
-		return lc2.writeToFile(configFile)
-	})
+	throttler.OnUpdate(
+		func(l throttling.Limits) error {
+			log(ctx).Infof("throttling tried to update limits: %v", l)
+			return nil
+			// lc2, err2 := LoadConfigFromFile(configFile)
+			// if err2 != nil {
+			// 	return err2
+			// }
+			//
+			// lc2.Throttling = &l
+			//
+			// return lc2.writeToFile(configFile)
+		},
+	)
 
 	blobcfg, err := fmgr.BlobCfgBlob(ctx)
 	if err != nil {
@@ -297,31 +357,38 @@ func openWithConfig(ctx context.Context, st blob.Storage, cliOpts ClientOptions,
 		st = wrapLockingStorage(st, blobcfg)
 	}
 
-	_, err = retry.WithExponentialBackoffMaxRetries(ctx, -1, "wait for upgrade", func() (interface{}, error) {
-		uli, err := fmgr.UpgradeLockIntent(ctx)
-		if err != nil {
-			//nolint:wrapcheck
-			return nil, err
-		}
-
-		// retry if upgrade lock has been taken
-		if !cliOpts.PermissiveCacheLoading {
-			if locked, _ := uli.IsLocked(cmOpts.TimeNow()); locked && options.UpgradeOwnerID != uli.OwnerID {
-				return nil, ErrRepositoryUnavailableDueToUpgradeInProgress
+	_, err = retry.WithExponentialBackoffMaxRetries(
+		ctx, -1, "wait for upgrade", func() (interface{}, error) {
+			uli, err := fmgr.UpgradeLockIntent(ctx)
+			if err != nil {
+				//nolint:wrapcheck
+				return nil, err
 			}
-		}
 
-		return false, nil
-	}, func(internalErr error) bool {
-		return !options.DoNotWaitForUpgrade && errors.Is(internalErr, ErrRepositoryUnavailableDueToUpgradeInProgress)
-	})
+			// retry if upgrade lock has been taken
+			if !cliOpts.PermissiveCacheLoading {
+				if locked, _ := uli.IsLocked(cmOpts.TimeNow()); locked && options.UpgradeOwnerID != uli.OwnerID {
+					return nil, ErrRepositoryUnavailableDueToUpgradeInProgress
+				}
+			}
+
+			return false, nil
+		}, func(internalErr error) bool {
+			return !options.DoNotWaitForUpgrade && errors.Is(
+				internalErr, ErrRepositoryUnavailableDueToUpgradeInProgress,
+			)
+		},
+	)
 	if err != nil {
 		return nil, err
 	}
 
 	if !cliOpts.PermissiveCacheLoading {
 		// background/interleaving upgrade lock storage monitor
-		st = upgradeLockMonitor(fmgr, options.UpgradeOwnerID, st, cmOpts.TimeNow, options.OnFatalError, options.TestOnlyIgnoreMissingRequiredFeatures)
+		st = upgradeLockMonitor(
+			fmgr, options.UpgradeOwnerID, st, cmOpts.TimeNow, options.OnFatalError,
+			options.TestOnlyIgnoreMissingRequiredFeatures,
+		)
 	}
 
 	dw := repodiag.NewWriter(st, fmgr)
@@ -332,10 +399,12 @@ func openWithConfig(ctx context.Context, st blob.Storage, cliOpts ClientOptions,
 		return nil, errors.Wrap(ferr, "unable to create shared content manager")
 	}
 
-	cm := content.NewWriteManager(ctx, scm, content.SessionOptions{
-		SessionUser: cliOpts.Username,
-		SessionHost: cliOpts.Hostname,
-	}, "")
+	cm := content.NewWriteManager(
+		ctx, scm, content.SessionOptions{
+			SessionUser: cliOpts.Username,
+			SessionHost: cliOpts.Hostname,
+		}, "",
+	)
 
 	om, ferr := object.NewObjectManager(ctx, cm, fmgr.ObjectFormat(), mr)
 	if ferr != nil {
@@ -403,18 +472,20 @@ func wrapLockingStorage(st blob.Storage, r format.BlobStorageConfiguration) blob
 	// collect prefixes that need to be locked on put
 	prefixes := GetLockingStoragePrefixes()
 
-	return beforeop.NewWrapper(st, nil, nil, nil, func(_ context.Context, id blob.ID, opts *blob.PutOptions) error {
-		for _, prefix := range prefixes {
-			if strings.HasPrefix(string(id), prefix) {
-				opts.RetentionMode = r.RetentionMode
-				opts.RetentionPeriod = r.RetentionPeriod
+	return beforeop.NewWrapper(
+		st, nil, nil, nil, func(_ context.Context, id blob.ID, opts *blob.PutOptions) error {
+			for _, prefix := range prefixes {
+				if strings.HasPrefix(string(id), prefix) {
+					opts.RetentionMode = r.RetentionMode
+					opts.RetentionPeriod = r.RetentionPeriod
 
-				break
+					break
+				}
 			}
-		}
 
-		return nil
-	})
+			return nil
+		},
+	)
 }
 
 func addThrottler(st blob.Storage, limits throttling.Limits) (blob.Storage, throttling.SettableThrottler, error) {
